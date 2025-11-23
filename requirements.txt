@@ -1,0 +1,5 @@
+streamlit>=1.41.0
+langchain-google-genai
+langchain-core
+tmdbv3api
+pandas
