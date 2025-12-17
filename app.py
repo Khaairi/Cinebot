@@ -6,10 +6,14 @@ import base64
 from tmdbv3api import TMDb, Movie
 import json
 import pandas as pd
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 tmdb = TMDb()
 tmdb.language = 'en'
-tmdb.api_key = "a81911c9b55527fb6cb67697e66fb848"
+tmdb.api_key = os.getenv("TMBD_API_KEY")
 movie_service = Movie()
 
 if "watchlist" not in st.session_state:
@@ -46,6 +50,11 @@ def get_movie_info(query: str):
 
         raw_rating = getattr(details, 'vote_average', 0)
         rating_fixed = round(raw_rating, 1)
+        list_genres = []
+        for item in details.genres:
+            list_genres.append(item["name"])
+
+        final_genres = ", ".join(list_genres)
         
         # Cek poster path
         if res.poster_path:
@@ -60,6 +69,7 @@ def get_movie_info(query: str):
             "original_title": res.original_title,
             "overview": res.overview,
             "rating": rating_fixed,
+            "genre": final_genres,
             "release_date": res.release_date,
             "poster": poster_url,
             "runtime": details.runtime,
@@ -81,6 +91,16 @@ def add_to_watchlist(query: str):
             return json.dumps({"status": "failed", "message": f"Film '{query}' tidak ditemukan, gagal menambahkan."})
         
         movie = search[0]
+
+        movie_id = movie.id
+
+        details = movie_service.details(movie_id)
+
+        list_genres = []
+        for item in details.genres:
+            list_genres.append(item["name"])
+
+        final_genres = ", ".join(list_genres)
         
         # Cek apakah sudah ada di watchlist
         current_ids = [m['id'] for m in st.session_state["watchlist"]]
@@ -91,8 +111,9 @@ def add_to_watchlist(query: str):
         new_entry = {
             "id": movie.id,
             "title": movie.title,
-            "release_date": movie.release_date,
-            "rating": movie.vote_average
+            "genre": final_genres,
+            "rating": f"{movie.vote_average:.1f}",
+            "runtime": details.runtime
         }
         st.session_state["watchlist"].append(new_entry)
         
@@ -141,6 +162,61 @@ def remove_from_watchlist(query: str):
 
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
+    
+@tool
+def recommend_from_watchlist(target_genre: str, max_minutes: int):
+    """
+    Gunakan alat ini jika user ingin dibuatkan jadwal/daftar tontonan dari watchlist mereka 
+    berdasarkan waktu luang (durasi) dan genre yang diinginkan.
+    
+    Input:
+        target_genre (str): Genre yang diinginkan user (misal: 'Horror', 'Action', 'Drama').
+        max_minutes (int): Total waktu luang user dalam MENIT (misal: 6 jam = 360 menit).
+    """
+    watchlist = st.session_state["watchlist"]
+    
+    if not watchlist:
+        return json.dumps({"found": False, "message": "Watchlist kamu kosong. Tambahkan film dulu!"})
+
+    # 1. Filter berdasarkan Genre
+    # Jika user bilang 'bebas', target_genre bisa diabaikan atau string kosong
+    filtered_movies = []
+    if target_genre and target_genre.lower() != "bebas":
+        for m in watchlist:
+            # Cek apakah genre user ada di dalam list genre film
+            # m['genres'] adalah list string, misal ["Horror", "Thriller"]
+            movie_genres = [g.lower() for g in m.get('genres', [])]
+            if target_genre.lower() in movie_genres:
+                filtered_movies.append(m)
+    else:
+        filtered_movies = watchlist # Ambil semua jika genre bebas
+
+    # 2. Sorting: Prioritaskan Rating Tinggi
+    filtered_movies.sort(key=lambda x: x['rating'], reverse=True)
+
+    # 3. Logika Seleksi (Greedy Algorithm sederhana)
+    selected_movies = []
+    current_time = 0
+    
+    for movie in filtered_movies:
+        runtime = movie.get('runtime', 0)
+        if current_time + runtime <= max_minutes:
+            selected_movies.append(movie)
+            current_time += runtime
+
+    if not selected_movies:
+        return json.dumps({
+            "found": False, 
+            "message": f"Tidak ada film genre '{target_genre}' di watchlist yang cukup untuk waktumu."
+        })
+
+    return json.dumps({
+        "found": True,
+        "total_movies": len(selected_movies),
+        "total_runtime": current_time,
+        "genre_requested": target_genre,
+        "movies": selected_movies
+    })
 
 st.set_page_config(
     page_title="CineBot",
@@ -160,11 +236,14 @@ with st.sidebar:
 
     st.divider()
     
-    # Input API Key
-    gemini_key = st.text_input("Masukkan Google Gemini API Key:", type="password")
-    st.markdown("[Belum punya API Key? dapatkan di sini](https://aistudio.google.com/app/apikey)")
+    # Input API Key atau masukkan di env
+    if not os.getenv("GEMINI_KEY"):
+        gemini_key = st.text_input("Masukkan Google Gemini API Key:", type="password")
+        st.markdown("[Belum punya API Key? dapatkan di sini](https://aistudio.google.com/app/apikey)")
 
-    st.divider()
+        st.divider()
+    else:
+        gemini_key = os.getenv("GEMINI_KEY")
 
     st.header("My Watchlist")
     uploaded_watchlist = st.file_uploader("Upload JSON", type=["json"], key="static_uploader")
@@ -186,7 +265,7 @@ def render_watchlist_ui(key_suffix="init"):
     with watchlist_placeholder.container():
         if st.session_state["watchlist"]:
             df = pd.DataFrame(st.session_state["watchlist"])
-            st.dataframe(df[['title', 'rating']], hide_index=True, use_container_width=True)
+            st.dataframe(df[['title', 'genre', 'rating', 'runtime']], hide_index=True, use_container_width=True)
             
             json_str = json.dumps(st.session_state["watchlist"], indent=4)
             
@@ -235,9 +314,9 @@ if not gemini_key:
     st.warning("Masukkan Google Gemini API Key di sidebar untuk memulai.")
     st.stop()
 
-tools = [get_movie_info, add_to_watchlist, remove_from_watchlist]
+tools = [get_movie_info, add_to_watchlist, remove_from_watchlist, recommend_from_watchlist]
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=gemini_key)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=gemini_key)
 llm = llm.bind_tools(tools)
 
 if "messages_history" not in st.session_state:
@@ -266,9 +345,15 @@ for message in messages_history:
                             st.image(data['poster'], use_container_width=True)
                         with col2:
                             st.subheader(data['title'])
-                            st.caption(f"Original Title: {data['original_title']} | Rilis: {data['release_date']} | Runtime: {data['runtime']} Min")
+                            st.caption(f"Original Title: {data['original_title']} | | Genre: {data['genre']} | Rilis: {data['release_date']} | Runtime: {data['runtime']} Min")
                             st.write(f"⭐ **{data['rating']}**")
                             st.info(data['overview'])
+                elif data.get("movies"):
+                    st.success(f"🎬 Terpilih {data['total_movies']} film (Total: {data['total_runtime']} menit):")
+                    for mov in data['movies']:
+                        with st.container(border=True):
+                            st.write(f"**{mov['title']}**")
+                            st.caption(f"⏱️ {mov['runtime']} min | ⭐ {mov['rating']}")
                 elif "status" in data: 
                     if data["status"] == "success":
                         st.success(data["message"])
@@ -355,7 +440,7 @@ if prompt:
                                     st.image(data['poster'], use_container_width=True)
                                 with col2:
                                     st.subheader(data['title'])
-                                    st.caption(f"Original Title: {data['original_title']} | Rilis: {data['release_date']} | Runtime: {data['runtime']} Min")
+                                    st.caption(f"Original Title: {data['original_title']} | | Genre: {data['genre']} | Rilis: {data['release_date']} | Runtime: {data['runtime']} Min")
                                     st.write(f"⭐ **{data['rating']}**")
                                     st.info(data['overview'])
                         else:
@@ -381,6 +466,22 @@ if prompt:
                             render_watchlist_ui("refresh_remove") # REFRESH UI
                         else:
                             st.error(data["message"])
+                    elif tool_name == "recommend_from_watchlist":
+                        raw_res = recommend_from_watchlist.invoke(tool_args)
+                        data = json.loads(raw_res)
+                        
+                        if data.get("found"):
+                            st.success(f"🎬 Ketemu nih! Ada {data['total_movies']} film Horror yang pas buat 6 jam:")
+                            # Loop untuk menampilkan hasil pilihan
+                            for mov in data['movies']:
+                                with st.container(border=True):
+                                    st.write(f"**{mov['title']}**")
+                                    # Tampilkan list genre jika ada
+                                    g_list = ", ".join(mov['genres']) if isinstance(mov['genres'], list) else mov['genres']
+                                    st.caption(f"⏱️ {mov['runtime']} menit | ⭐ {mov['rating']} | {g_list}")
+                        else:
+                            st.warning(data.get("message"))
+                    
 
                     # Simpan hasil tool ke history agar AI tahu datanya
                     messages_history.append(ToolMessage(
